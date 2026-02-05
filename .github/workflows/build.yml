@@ -625,6 +625,7 @@ jobs:
         CONFIG_USB_GADGET=y
         CONFIG_CONFIGFS_FS=y
         CONFIG_USB_CONFIGFS=y
+        CONFIG_USB_CONFIGFS_RNDIS=y
         CONFIG_USB_LIBCOMPOSITE=m
         CONFIG_USB_AUDIO=m
         CONFIG_USB_CONFIGFS_F_UAC1=y
@@ -693,7 +694,7 @@ jobs:
         fi
 
     - name: Append ashmem exports if missing
-      if: ${{ inputs.android_version == 'android16' && inputs.kernel_version == '6.12' }}
+      if: ${{ inputs.android_version == 'android16' && inputs.kernel_version == '6.12' && false }}
       working-directory: ${{ env.KERNEL_ROOT }}
       run: |
         FILE=common/drivers/staging/android/ashmem.c
@@ -792,10 +793,58 @@ jobs:
           PATH="/usr/bin:/bin:$PATH" HOSTLDFLAGS="-B/usr/bin ${HOSTLDFLAGS:-}" LDFLAGS="-B/usr/bin ${LDFLAGS:-}" \
           GKI_DEFCONFIG_FRAGMENT="${{ env.DEFCONFIG_FRAGMENT }}" LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh || exit 1
         else
-          if [[ "${{ inputs.android_version }}" == "android14" ]]; then
-            tools/bazel build --config=fast --lto=thin --defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment //common:kernel_aarch64_dist || exit 1
-          else
-            tools/bazel build --config=fast --lto=none --defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment //common:kernel_aarch64_dist || exit 1
+          apply_defconfig_fragment() {
+            if [ -f "$DEFCONFIG" ] && [ -f "$DEFCONFIG_FRAGMENT" ]; then
+              if [ -f common/scripts/kconfig/merge_config.sh ]; then
+                (
+                  cd common
+                  ./scripts/kconfig/merge_config.sh -m -r arch/arm64/configs/gki_defconfig "$DEFCONFIG_FRAGMENT"
+                  cp .config arch/arm64/configs/gki_defconfig
+                )
+              else
+                cat "$DEFCONFIG_FRAGMENT" >> "$DEFCONFIG"
+              fi
+            fi
+          }
+
+          BAZEL_LTO=none
+          if [[ "${{ inputs.android_version }}" == "android12" || "${{ inputs.android_version }}" == "android13" || "${{ inputs.android_version }}" == "android14" ]]; then
+            BAZEL_LTO=thin
+          fi
+
+          BAZEL_ARGS=(build --config=fast "--lto=$BAZEL_LTO" --defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment //common:kernel_aarch64_dist)
+          set +e
+          tools/bazel "${BAZEL_ARGS[@]}" 2>&1 | tee bazel_build.log
+          BAZEL_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$BAZEL_STATUS" -ne 0 ]; then
+            UNREC_DEFCONFIG=false
+            UNREC_LTO=false
+            if grep -q "Unrecognized option: --defconfig_fragment" bazel_build.log; then
+              UNREC_DEFCONFIG=true
+            fi
+            if grep -q "Unrecognized option: --lto" bazel_build.log; then
+              UNREC_LTO=true
+            fi
+
+            if [ "$UNREC_DEFCONFIG" = "true" ] || [ "$UNREC_LTO" = "true" ]; then
+              if [ "$UNREC_DEFCONFIG" = "true" ]; then
+                apply_defconfig_fragment
+              fi
+
+              BAZEL_ARGS=(build --config=fast)
+              if [ "$UNREC_LTO" != "true" ]; then
+                BAZEL_ARGS+=("--lto=$BAZEL_LTO")
+              fi
+              if [ "$UNREC_DEFCONFIG" != "true" ]; then
+                BAZEL_ARGS+=(--defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment)
+              fi
+              BAZEL_ARGS+=(//common:kernel_aarch64_dist)
+
+              tools/bazel "${BAZEL_ARGS[@]}" || exit 1
+            else
+              exit "$BAZEL_STATUS"
+            fi
           fi
         fi
 
